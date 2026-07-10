@@ -18627,7 +18627,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.room_observation import load_observed_room_context
 
             observed_room_context = load_observed_room_context(
-                self.session_store,
+                getattr(self, "session_store", None),
                 source,
             ) or legacy_observed_context
 
