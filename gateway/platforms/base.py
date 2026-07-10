@@ -4618,6 +4618,15 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        # Observation events are persistence-only. Route them directly to the
+        # gateway before command coercion, per-session guards, typing/reaction
+        # hooks, pending-message queues, or response delivery can create visible
+        # room side effects. The gateway's OBSERVE branch authorizes, persists,
+        # and returns without invoking an agent.
+        if event.disposition is MessageDisposition.OBSERVE:
+            await self._message_handler(event)
+            return
+
         coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook

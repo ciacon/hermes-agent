@@ -1824,11 +1824,20 @@ class SessionStore:
             ):
                 continue
             raw_timestamp = row.get("timestamp")
-            if not isinstance(raw_timestamp, str) or not raw_timestamp.strip():
-                continue
             try:
-                parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
-            except ValueError:
+                if isinstance(raw_timestamp, (int, float)) and not isinstance(
+                    raw_timestamp, bool
+                ):
+                    # SessionDB persists timestamps as Unix seconds (SQLite REAL),
+                    # while the JSONL fallback and older fixtures use ISO strings.
+                    parsed = datetime.fromtimestamp(float(raw_timestamp), tz=timezone.utc)
+                elif isinstance(raw_timestamp, str) and raw_timestamp.strip():
+                    parsed = datetime.fromisoformat(
+                        raw_timestamp.replace("Z", "+00:00")
+                    )
+                else:
+                    continue
+            except (OverflowError, OSError, TypeError, ValueError):
                 continue
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)

@@ -388,6 +388,24 @@ def test_bounded_observation_retrieval_applies_age_limit_count_limit_and_order()
     ]
 
 
+def test_observation_retrieval_accepts_sqlite_numeric_timestamps():
+    from gateway.room_observation import room_scoped_source
+
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    source = _make_source(thread_id=None)
+    store = _make_retrieval_store()
+    row = _observed_row("persisted numeric timestamp", now - timedelta(minutes=1))
+    row["timestamp"] = (now - timedelta(minutes=1)).timestamp()
+    _route_room_transcript(store, source, [row], "numeric-timestamp-session")
+
+    result = store.load_recent_observed_messages(
+        room_scoped_source(source),
+        now=now,
+    )
+
+    assert result == [row]
+
+
 def test_per_user_addressed_keys_remain_separate_while_room_context_is_shared():
     from gateway.room_observation import load_observed_room_context
 
