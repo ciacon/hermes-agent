@@ -1704,6 +1704,24 @@ class MessageType(Enum):
     COMMAND = "command"  # /command style
 
 
+class MessageDisposition(str, Enum):
+    """Handling disposition for a normalized incoming message."""
+
+    DROP = "drop"
+    OBSERVE = "observe"
+    DISPATCH = "dispatch"
+
+
+@dataclass(frozen=True)
+class MessageAddressing:
+    """Platform-neutral facts describing how a message was addressed."""
+
+    direct_mention: bool = False
+    reply_to_self: bool = False
+    mentions_other_bots: bool = False
+    mentions_other_users: bool = False
+
+
 class ProcessingOutcome(Enum):
     """Result classification for message-processing lifecycle hooks."""
 
@@ -1778,6 +1796,13 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Platform-neutral routing facts. These are appended to preserve the
+    # positional order of the existing public MessageEvent constructor.
+    # Adapters populate facts here instead of encoding them in free-form
+    # metadata; dispatch remains the backwards-compatible default.
+    addressing: MessageAddressing = field(default_factory=MessageAddressing)
+    disposition: MessageDisposition = MessageDisposition.DISPATCH
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
