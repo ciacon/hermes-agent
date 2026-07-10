@@ -16,7 +16,7 @@ import json
 import threading
 import uuid
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
@@ -1771,6 +1771,74 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             return len(self._entries) > 1
+
+    def get_existing_session(self, source: SessionSource) -> Optional[SessionEntry]:
+        """Return the routed session for *source* without creating or refreshing it."""
+
+        session_key = self._generate_session_key(source)
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def load_recent_observed_messages(
+        self,
+        source: SessionSource,
+        *,
+        now: Optional[datetime] = None,
+        limit: int = 25,
+        max_age: timedelta = timedelta(hours=6),
+    ) -> List[Dict[str, Any]]:
+        """Load bounded observed user rows for an existing room-scoped session.
+
+        The lookup is deliberately non-creating: an addressed turn with no prior
+        ambient observations must not manufacture an empty room session. Rows
+        with missing or malformed timestamps fail closed so stale context cannot
+        bypass the age bound.
+        """
+
+        try:
+            effective_limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            return []
+        if effective_limit == 0 or max_age.total_seconds() < 0:
+            return []
+
+        entry = self.get_existing_session(source)
+        if entry is None:
+            return []
+
+        reference = now or datetime.now(timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        reference = reference.astimezone(timezone.utc)
+        cutoff = reference - max_age
+        bounded: List[tuple[datetime, Dict[str, Any]]] = []
+
+        for row in self.load_transcript(entry.session_id):
+            if (
+                not isinstance(row, dict)
+                or row.get("role") != "user"
+                or not row.get("observed")
+                or not isinstance(row.get("content"), str)
+                or not row.get("content")
+            ):
+                continue
+            raw_timestamp = row.get("timestamp")
+            if not isinstance(raw_timestamp, str) or not raw_timestamp.strip():
+                continue
+            try:
+                parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            parsed = parsed.astimezone(timezone.utc)
+            if parsed < cutoff:
+                continue
+            bounded.append((parsed, row))
+
+        bounded.sort(key=lambda item: item[0])
+        return [dict(row) for _timestamp, row in bounded[-effective_limit:]]
 
     def get_or_create_session(
         self,
