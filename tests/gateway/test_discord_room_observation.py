@@ -82,6 +82,7 @@ def make_message(
     channel=None,
     content: str = "ambient hello",
     mentions=None,
+    role_mentions=None,
     author=None,
     reference=None,
     attachments=None,
@@ -99,6 +100,7 @@ def make_message(
         content=content,
         clean_content=content,
         mentions=list(mentions or []),
+        role_mentions=list(role_mentions or []),
         attachments=list(attachments or []),
         message_snapshots=[],
         reference=reference,
@@ -124,6 +126,46 @@ def test_observation_config_defaults_off_and_rejects_wildcards_or_names(adapter)
 
     assert adapter._discord_observation_enabled() is True
     assert adapter._discord_observed_channel_ids() == {"123"}
+
+
+@pytest.mark.asyncio
+async def test_durable_observation_suppresses_legacy_history_backfill(adapter):
+    enable_observation(adapter, "123")
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(
+        return_value="[Recent channel messages]\n[Alice] duplicate context"
+    )
+    message = make_message(
+        adapter=adapter,
+        content="<@999> current request",
+        mentions=[adapter._client.user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "current request"
+
+
+@pytest.mark.asyncio
+async def test_legacy_history_backfill_remains_active_outside_observed_channel(adapter):
+    enable_observation(adapter, "999")
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(
+        return_value="[Recent channel messages]\n[Alice] legacy context"
+    )
+    message = make_message(
+        adapter=adapter,
+        content="<@999> current request",
+        mentions=[adapter._client.user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -212,6 +254,84 @@ async def test_explicit_self_mention_dispatches_once_and_never_observes(adapter)
     event = adapter.handle_message.await_args.args[0]
     assert event.disposition is MessageDisposition.DISPATCH
     assert event.addressing.direct_mention is True
+
+
+@pytest.mark.asyncio
+async def test_self_managed_role_mention_dispatches_once_and_never_observes(adapter):
+    enable_observation(adapter, "123")
+    self_role = SimpleNamespace(
+        id=777,
+        tags=SimpleNamespace(bot_id=adapter._client.user.id),
+        managed=True,
+    )
+    message = make_message(
+        adapter=adapter,
+        content="<@&777> what did ciacon and Destruxus contribute?",
+        role_mentions=[self_role],
+    )
+
+    observed = await adapter._maybe_observe_room_message(message)
+    if not observed:
+        await adapter._handle_message(message)
+
+    assert observed is False
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.disposition is MessageDisposition.DISPATCH
+    assert event.addressing.direct_mention is True
+    assert event.text == "what did ciacon and Destruxus contribute?"
+
+
+@pytest.mark.asyncio
+async def test_raw_self_managed_role_resolves_from_guild_cache(adapter):
+    enable_observation(adapter, "123")
+    self_role = SimpleNamespace(
+        id=777,
+        tags=SimpleNamespace(bot_id=adapter._client.user.id),
+        managed=True,
+    )
+    channel = FakeTextChannel()
+    channel.guild.get_role = lambda role_id: self_role if role_id == 777 else None
+    message = make_message(
+        adapter=adapter,
+        channel=channel,
+        content="<@&777> cached role mention",
+    )
+
+    observed = await adapter._maybe_observe_room_message(message)
+    if not observed:
+        await adapter._handle_message(message)
+
+    assert observed is False
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.disposition is MessageDisposition.DISPATCH
+    assert event.addressing.direct_mention is True
+    assert event.text == "cached role mention"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_managed_role_mention_remains_ambient_observation(adapter):
+    enable_observation(adapter, "123")
+    other_role = SimpleNamespace(
+        id=888,
+        tags=SimpleNamespace(bot_id=123456),
+        managed=True,
+    )
+    message = make_message(
+        adapter=adapter,
+        content="<@&888> unrelated role question",
+        role_mentions=[other_role],
+    )
+
+    observed = await adapter._maybe_observe_room_message(message)
+
+    assert observed is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.disposition is MessageDisposition.OBSERVE
+    assert event.addressing.direct_mention is False
+    assert event.text == "<@&888> unrelated role question"
 
 
 @pytest.mark.asyncio

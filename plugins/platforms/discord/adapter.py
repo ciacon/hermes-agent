@@ -4855,30 +4855,75 @@ class DiscordAdapter(BasePlatformAdapter):
         content = getattr(message, "content", "") or ""
         return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
 
-    def _self_is_explicitly_mentioned(self, message: Any) -> bool:
-        """Return True when this bot is explicitly @mentioned in the message.
+    def _raw_mentioned_role_ids(self, message: Any) -> set[str]:
+        """Extract Discord role-mention IDs from raw ``<@&ROLE_ID>`` tokens."""
 
-        Treats the bot as mentioned if it is either present in the resolved
-        ``message.mentions`` list OR referenced by its raw ``<@ID>`` / ``<@!ID>``
-        form in the message content.
+        content = getattr(message, "content", "") or ""
+        return {match.group(1) for match in re.finditer(r"<@&(\d+)>", content)}
+
+    def _role_is_managed_by_self(self, role: Any) -> bool:
+        """Return whether ``role`` is the current bot's managed Discord role."""
+
+        if not self._client or not self._client.user or role is None:
+            return False
+        tags = getattr(role, "tags", None)
+        return str(getattr(tags, "bot_id", "")) == str(self._client.user.id)
+
+    def _self_managed_role_ids(self, message: Any) -> set[str]:
+        """Return mentioned role IDs that Discord marks as managed by this bot."""
+
+        raw_role_ids = self._raw_mentioned_role_ids(message)
+        if not raw_role_ids:
+            return set()
+
+        roles = list(getattr(message, "role_mentions", []) or [])
+        resolved_ids = {str(getattr(role, "id", "")) for role in roles}
+        guild = getattr(message, "guild", None)
+        get_role = getattr(guild, "get_role", None)
+        if callable(get_role):
+            for role_id in raw_role_ids - resolved_ids:
+                try:
+                    role = get_role(int(role_id))
+                except (TypeError, ValueError):
+                    role = None
+                if role is not None:
+                    roles.append(role)
+
+        return {
+            str(getattr(role, "id", ""))
+            for role in roles
+            if str(getattr(role, "id", "")) in raw_role_ids
+            and self._role_is_managed_by_self(role)
+        }
+
+    def _self_is_explicitly_mentioned(self, message: Any) -> bool:
+        """Return True when this bot or its managed role is explicitly mentioned.
+
+        User mentions can be resolved through ``message.mentions`` or raw
+        ``<@ID>`` / ``<@!ID>`` content. Discord bot integrations also own a
+        managed role; an inline ``<@&ROLE_ID>`` counts only when RoleTags.bot_id
+        identifies the current bot, never merely by role name or assignment.
         """
         if not self._client or not self._client.user:
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        return self._self_is_raw_mentioned(message)
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
-        """Return True only when this bot has an inline mention token.
+        """Return True only when this bot has an inline user or managed-role token.
 
         Discord reply-pings can add the replied-to bot to ``message.mentions``
-        without a literal ``<@bot>`` token in ``message.content``. This helper
-        intentionally ignores the resolved mentions list so the bot admission
-        gate can distinguish an explicit cross-bot address from a reply chip.
+        without a literal token in ``message.content``. This helper intentionally
+        ignores that resolved user list so the bot admission gate can distinguish
+        an explicit cross-bot address from a reply chip.
         """
         if not self._client or not self._client.user:
             return False
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        raw_user_mention = str(self._client.user.id) in self._raw_mentioned_user_ids(
+            message
+        )
+        return raw_user_mention or bool(self._self_managed_role_ids(message))
 
     def _discord_reply_to_self(self, message: Any) -> bool:
         """Return True when a Discord reply targets a message authored by this bot."""
@@ -6375,8 +6420,16 @@ class DiscordAdapter(BasePlatformAdapter):
         if addressing.direct_mention or addressing.reply_to_self:
             mention_prefix = True
             if addressing.direct_mention and self._client and self._client.user:
-                normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
-                normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+                normalized_content = normalized_content.replace(
+                    f"<@{self._client.user.id}>", ""
+                ).strip()
+                normalized_content = normalized_content.replace(
+                    f"<@!{self._client.user.id}>", ""
+                ).strip()
+                for role_id in self._self_managed_role_ids(message):
+                    normalized_content = normalized_content.replace(
+                        f"<@&{role_id}>", ""
+                    ).strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -6706,7 +6759,21 @@ class DiscordAdapter(BasePlatformAdapter):
         # to keep the partition rule clean.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
+        # Durable room observation is the single source of ambient context for
+        # explicitly observed channels. Running Discord's legacy history scan
+        # as well duplicates the same messages, persists them into the addressed
+        # user session, and can replay missed requests on a later turn.
+        _durable_observation_owns_context = (
+            not _is_dm
+            and self._discord_observation_enabled()
+            and str(getattr(message.channel, "id", ""))
+            in self._discord_observed_channel_ids()
+        )
+        if (
+            not _is_dm
+            and self._discord_history_backfill()
+            and not _durable_observation_owns_context
+        ):
             # Run backfill when there's a real gap to fill:
             #   - mention-gated channels with no free-response override
             #     (messages between bot turns aren't in the transcript)

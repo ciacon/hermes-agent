@@ -252,6 +252,56 @@ async def test_alice_mention_uses_alice_session_and_shared_room_context(presence
     assert call.session_key.endswith(":101")
 
 
+async def test_managed_self_role_dispatches_without_delayed_room_observation(
+    presence_stack,
+):
+    lucy = _author(451517281223180310, "LucyferOS")
+    channel = make_fake_text_channel()
+    self_role = SimpleNamespace(
+        id=1501871552705204237,
+        tags=SimpleNamespace(bot_id=BOT_USER_ID),
+        managed=True,
+    )
+    role_question = make_discord_message(
+        content=(
+            f"<@&{self_role.id}> what did ciacon and Destruxus "
+            "contribute to our conversation?"
+        ),
+        author=lucy,
+        channel=channel,
+    )
+    role_question.role_mentions = [self_role]
+
+    observed = await _route_authorized_message(presence_stack, role_question)
+
+    assert observed is False
+    assert len(presence_stack.agent_calls) == 1
+    first_call = presence_stack.agent_calls[0]
+    assert first_call.event.text == (
+        "what did ciacon and Destruxus contribute to our conversation?"
+    )
+    assert first_call.event.addressing.direct_mention is True
+    assert first_call.room_context is None
+    assert _room_context(presence_stack, lucy, channel) is None
+
+    observed = await _route_authorized_message(
+        presence_stack,
+        make_discord_message(
+            content=f"<@{BOT_USER_ID}> are you there?",
+            author=lucy,
+            channel=channel,
+            mentions=[presence_stack.adapter._client.user],
+        ),
+    )
+
+    assert observed is False
+    assert len(presence_stack.agent_calls) == 2
+    second_call = presence_stack.agent_calls[1]
+    assert second_call.event.text == "are you there?"
+    assert second_call.room_context is None
+    assert _room_context(presence_stack, lucy, channel) is None
+
+
 async def test_bob_mention_gets_separate_session_and_same_room_context(presence_stack):
     alice = _author(101, "Alice")
     bob = _author(202, "Bob")
