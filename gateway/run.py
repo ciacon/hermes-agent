@@ -1760,6 +1760,7 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MessageDisposition,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
@@ -8893,6 +8894,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+        is_observe = event.disposition is MessageDisposition.OBSERVE
+        if is_internal and is_observe:
+            logger.warning(
+                "Ignoring observe disposition on internal event: platform=%s chat=%s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id or "unknown",
+            )
+            return None
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -8953,9 +8962,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
+                if is_observe:
+                    logger.debug(
+                        "Dropping unauthorized room observation without user identity: "
+                        "platform=%s chat=%s",
+                        source.platform.value,
+                        source.chat_id,
+                    )
+                    return None
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
         elif not self._is_user_authorized(source):
+            if is_observe:
+                logger.debug(
+                    "Dropping unauthorized room observation: user=%s platform=%s chat=%s",
+                    source.user_id,
+                    source.platform.value,
+                    source.chat_id,
+                )
+                return None
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
@@ -8996,7 +9021,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        if is_observe:
+            try:
+                from gateway.room_observation import persist_room_observation
+
+                observation_session_id = persist_room_observation(
+                    self.session_store,
+                    event,
+                )
+                logger.info(
+                    "Persisted authorized room observation: platform=%s chat=%s "
+                    "thread=%s session=%s",
+                    source.platform.value,
+                    source.chat_id,
+                    source.thread_id or "none",
+                    observation_session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist authorized room observation: platform=%s chat=%s",
+                    source.platform.value,
+                    source.chat_id,
+                    exc_info=True,
+                )
+            return None
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
