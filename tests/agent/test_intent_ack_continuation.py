@@ -144,6 +144,37 @@ def test_all_path_drops_workspace_requirement():
     )
 
 
+def test_subjectless_present_progressive_acks_fire():
+    """Chat-style progress narration must not escape as a final response."""
+    a = _agent(True, "chat_completions")
+    user = "If you are curious, inspect https://example.com/the-diff"
+    msgs = [{"role": "user", "content": user}]
+    for ack in (
+        "Checking it out now.",
+        "Checking it out. Thanks for the link.",
+        "Looking at the diff now.",
+        "Reviewing the linked page now.",
+    ):
+        assert looks_like_codex_intermediate_ack(
+            a, user, ack, msgs, require_workspace=False
+        )
+
+
+def test_present_progressive_result_statements_do_not_fire():
+    """A gerund alone is not enough; completed findings remain final answers."""
+    a = _agent(True, "chat_completions")
+    user = "check the server logs"
+    msgs = [{"role": "user", "content": user}]
+    for final in (
+        "Checking the logs shows no critical errors.",
+        "Looking at the diff, the implementation covers seven commits.",
+        "Looking good from here.",
+    ):
+        assert not looks_like_codex_intermediate_ack(
+            a, user, final, msgs, require_workspace=False
+        )
+
+
 # ── detector: guardrails that hold regardless of workspace ───────────────────
 
 

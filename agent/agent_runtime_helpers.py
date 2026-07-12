@@ -2672,11 +2672,12 @@ def looks_like_codex_intermediate_ack(
     passes ``require_workspace=False`` when the user has explicitly opted into
     intent-ack continuation for all api_modes (``agent.intent_ack_continuation``
     is ``true`` or a model-list), so general autonomous workflows ("I'll run a
-    health check on the server", "I'll start the deployment") — which carry a
-    future-ack and an action verb but no filesystem reference — are caught too.
-    The future-ack + short-content + no-prior-tools + action-verb requirements
-    always apply, which is what keeps conversational "I'll help you brainstorm"
-    replies from tripping it.
+    health check on the server", "I'll start the deployment") — which carry an
+    intent ack and an action verb but no filesystem reference — are caught too.
+    Short subjectless progress acks ("Checking it out", "Looking at the diff
+    now") are also treated as intent acks. The intent-ack + short-content +
+    no-prior-tools + action-verb requirements always apply, which is what keeps
+    conversational "I'll help you brainstorm" replies from tripping it.
     """
     if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
         return False
@@ -2687,15 +2688,35 @@ def looks_like_codex_intermediate_ack(
     if len(assistant_text) > 1200:
         return False
 
-    has_future_ack = bool(
+    has_intent_ack = bool(
         re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
     )
-    if not has_future_ack:
+    if not has_intent_ack:
+        # Social/chat models often omit the subject and narrate work in the
+        # present progressive: "Checking it out" or "Looking at the diff now".
+        # Require a pronoun object or an explicit trailing "now" so completed
+        # result statements such as "Checking the logs shows no errors" are not
+        # mistaken for premature acknowledgments.
+        present_progressive_ack = re.match(
+            r"^(?:(?:okay|ok|sure|alright|all right)[,.:!\-]*\s+)?(?:"
+            r"checking\s+(?:(?:it|this|that)(?:\s+out)?(?:\s+now)?|the\s+[^.!?\n]{1,80}\s+now)|"
+            r"looking\s+(?:at|into|through|over)\s+(?:(?:it|this|that)(?:\s+now)?|the\s+[^.!?\n]{1,80}\s+now)|"
+            r"(?:inspecting|reviewing|scanning|analyzing|analysing|opening|reading|searching|testing)\s+"
+            r"(?:(?:it|this|that)(?:\s+now)?|the\s+[^.!?\n]{1,80}\s+now)"
+            r")[.!?…]*(?:\s|$)",
+            assistant_text,
+        )
+        has_intent_ack = present_progressive_ack is not None
+    if not has_intent_ack:
         return False
 
     action_markers = (
         "look into",
         "look at",
+        "looking into",
+        "looking at",
+        "looking through",
+        "looking over",
         "inspect",
         "scan",
         "check",
@@ -2734,7 +2755,7 @@ def looks_like_codex_intermediate_ack(
     if not assistant_mentions_action:
         return False
 
-    # Opted-in (all-api_mode) path: a future-ack + action verb + no prior tool
+    # Opted-in (all-api_mode) path: an intent ack + action verb + no prior tool
     # call is enough — the user asked us to keep going when the model only
     # announces intent, regardless of whether a filesystem is involved.
     if not require_workspace:
