@@ -356,29 +356,3 @@ def test_select_cached_agent_history_prefers_longer_live_transcript():
     # No live transcript / not a list → no-op.
     assert _select_cached_agent_history(persisted, None) is persisted
     assert _select_cached_agent_history(persisted, "nope") is persisted
-
-
-def test_select_cached_agent_history_never_restores_observed_rows():
-    """A longer stale cache cannot bypass room-observation history filtering."""
-    from gateway.run import _select_cached_agent_history
-
-    persisted = [{"role": "user", "content": "addressed one"}]
-    live = [
-        {"role": "user", "content": "addressed one"},
-        {
-            "role": "user",
-            "content": "[Alice|1]\nambient",
-            "observed": True,
-        },
-        {"role": "assistant", "content": "reply"},
-        {"role": "user", "content": "addressed two"},
-    ]
-
-    selected = _select_cached_agent_history(persisted, live)
-
-    assert [row["content"] for row in selected] == [
-        "addressed one",
-        "reply",
-        "addressed two",
-    ]
-    assert all(not row.get("observed") for row in selected)

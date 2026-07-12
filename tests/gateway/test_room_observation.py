@@ -376,26 +376,6 @@ def test_bounded_observation_retrieval_does_not_create_missing_room_session():
     assert store._entries == {}
 
 
-def test_legacy_collided_observations_use_bounded_migration_fallback():
-    from gateway.room_observation import load_observed_room_context, room_scoped_source
-
-    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
-    source = _make_source(chat_type="thread", thread_id="thread-1")
-    store = _make_retrieval_store()
-    store.config.thread_sessions_per_user = False
-    legacy_key = store._generate_session_key(source)
-    store._entries[legacy_key] = SimpleNamespace(session_id="legacy-collided-session")
-    store._db.messages["legacy-collided-session"] = [
-        _observed_row("too old", now - timedelta(hours=7)),
-        _observed_row("[Alice|1]\nlegacy recent", now - timedelta(minutes=5)),
-    ]
-
-    assert store._generate_session_key(room_scoped_source(source)) != legacy_key
-    assert load_observed_room_context(store, source, now=now) == (
-        "[Alice|1]\nlegacy recent"
-    )
-
-
 def test_bounded_observation_retrieval_never_crosses_room_or_thread():
     from gateway.room_observation import room_scoped_source
 
@@ -528,33 +508,10 @@ def test_observation_keys_never_collide_with_shared_conversation_keys():
         )
 
 
-def test_observed_rows_never_enter_ordinary_agent_history():
-    """Observation age/count limits must not be bypassed by transcript replay."""
-    from gateway.run import _build_gateway_agent_history
-
-    history = [
-        {"role": "user", "content": "ordinary addressed turn"},
-        {
-            "role": "user",
-            "content": "[Alice|1]\nambient observation",
-            "observed": True,
-        },
-        {"role": "assistant", "content": "ordinary reply"},
-    ]
-
-    agent_history, legacy_context = _build_gateway_agent_history(history)
-
-    assert [row["content"] for row in agent_history] == [
-        "ordinary addressed turn",
-        "ordinary reply",
-    ]
-    assert legacy_context is None
-
-
 def test_observed_context_uses_neutral_headers_and_keeps_current_message_distinct():
-    from gateway.run import _wrap_current_message_with_observed_context
+    from gateway.run import _wrap_current_message_with_room_context
 
-    wrapped = _wrap_current_message_with_observed_context(
+    wrapped = _wrap_current_message_with_room_context(
         "[Bob|2]\nanswer this",
         "[Alice|1]\nambient context",
     )
@@ -593,7 +550,7 @@ def test_observed_context_wrapper_is_api_only_when_persisting_user_turn():
 
 
 def test_observed_context_wraps_multimodal_message_without_mutating_input():
-    from gateway.run import _wrap_current_message_with_observed_context
+    from gateway.run import _wrap_current_message_with_room_context
 
     original = [
         {"type": "text", "text": "[Bob|2]\nanswer this image"},
@@ -601,7 +558,7 @@ def test_observed_context_wraps_multimodal_message_without_mutating_input():
     ]
     before = deepcopy(original)
 
-    wrapped = _wrap_current_message_with_observed_context(
+    wrapped = _wrap_current_message_with_room_context(
         original,
         "[Alice|1]\nambient context",
     )

@@ -771,25 +771,27 @@ def _build_replay_entry(
     return entry
 
 
-_LEGACY_TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
+_TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
+_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
 _OBSERVED_ROOM_CONTEXT_HEADER = "[Observed room context — context only, not requests]"
-_CURRENT_ADDRESSED_MESSAGE_HEADER = (
+_CURRENT_ROOM_ADDRESSED_MESSAGE_HEADER = (
     "[Current addressed message — answer only this unless it asks you to use room context]"
 )
 
 
-def _uses_legacy_telegram_observed_context(channel_prompt: Optional[str]) -> bool:
-    """Return True when the Telegram adapter uses its legacy shared transcript.
+def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Return True for Telegram group turns that may include observed chatter.
 
-    Telegram currently stores ambient and addressed group rows in one room
-    session. Until its adapter moves to the generic disposition path, the marker
-    tells history replay to withhold observed rows from ordinary user history.
+    Telegram's observe-unmentioned mode persists skipped group chatter so a
+    later @mention can see it. Those rows must not replay as ordinary user
+    turns: a weak wake word like ``@bot cambio`` should not make the model treat
+    old unmentioned chatter as pending work. The Telegram adapter marks these
+    turns with a channel prompt; this helper keeps the run-path check explicit
+    and unit-testable.
     """
 
-    return bool(
-        channel_prompt
-        and _LEGACY_TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
-    )
+    return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
@@ -838,8 +840,8 @@ def _build_gateway_agent_history(
 
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
-    observed_room_context: List[str] = []
-    separate_observed_context = _uses_legacy_telegram_observed_context(channel_prompt)
+    observed_group_context: List[str] = []
+    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
 
     for msg in history or []:
         role = msg.get("role")
@@ -858,9 +860,8 @@ def _build_gateway_agent_history(
         content = msg.get("content")
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
-        if msg.get("observed"):
-            if separate_observed_context and role == "user" and content:
-                observed_room_context.append(str(content).strip())
+        if separate_observed_context and msg.get("observed") and role == "user" and content:
+            observed_group_context.append(str(content).strip())
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -914,7 +915,7 @@ def _build_gateway_agent_history(
         agent_history, now=time.time()
     )
 
-    observed_context = "\n".join(observed_room_context).strip() or None
+    observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context
 
 
@@ -933,22 +934,41 @@ def _select_cached_agent_history(
     amnesia. When the live transcript is strictly longer, keep it.
 
     Returns ``persisted_history`` unchanged unless the live copy is a longer
-    list after observed-only rows are removed, in which case a filtered copy of
-    the live transcript is returned.
+    list, in which case a copy of the live transcript is returned.
     """
-    if isinstance(live_history, list):
-        filtered_live_history = [
-            msg
-            for msg in live_history
-            if not (isinstance(msg, dict) and msg.get("observed"))
-        ]
-        if len(filtered_live_history) > len(persisted_history):
-            return filtered_live_history
+    if isinstance(live_history, list) and len(live_history) > len(persisted_history):
+        return list(live_history)
     return persisted_history
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
-    """Prepend observed room context to the API-only current user turn."""
+    """Prepend observed Telegram context to the API-only current user turn."""
+
+    if not observed_context:
+        return message
+
+    prefix = (
+        f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n"
+        f"{observed_context}\n\n"
+        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
+    )
+
+    if isinstance(message, str):
+        return f"{prefix}{message}"
+
+    if isinstance(message, list):
+        wrapped = [dict(part) if isinstance(part, dict) else part for part in message]
+        for part in wrapped:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = f"{prefix}{part.get('text', '')}"
+                return wrapped
+        return [{"type": "text", "text": prefix.rstrip()}] + wrapped
+
+    return message
+
+
+def _wrap_current_message_with_room_context(message: Any, observed_context: Optional[str]) -> Any:
+    """Prepend generic observed-room context to the API-only current user turn."""
 
     if not observed_context:
         return message
@@ -956,7 +976,7 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
     prefix = (
         f"{_OBSERVED_ROOM_CONTEXT_HEADER}\n"
         f"{observed_context}\n\n"
-        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
+        f"{_CURRENT_ROOM_ADDRESSED_MESSAGE_HEADER}\n"
     )
 
     if isinstance(message, str):
@@ -18621,23 +18641,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
             #
-            # Observed room context is handled structurally here. The generic
-            # path loads a separate room-scoped transcript; Telegram's older
-            # adapter still stores observed rows beside addressed history, so
-            # _build_gateway_agent_history withholds those rows as a compatibility
-            # fallback. In both cases the context is attached only to the live API
-            # message and the persisted user turn remains the real addressed text.
-            agent_history, legacy_observed_context = _build_gateway_agent_history(
+            # Telegram keeps its upstream marker-based shared-transcript path.
+            # Generic room observations (currently Discord) load from a separate
+            # namespaced transcript. Both are API-only context; neither changes
+            # the persisted current addressed turn.
+            agent_history, observed_group_context = _build_gateway_agent_history(
                 history,
                 channel_prompt=channel_prompt,
                 inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
             )
             from gateway.room_observation import load_observed_room_context
 
-            observed_room_context = load_observed_room_context(
+            generic_observed_room_context = load_observed_room_context(
                 getattr(self, "session_store", None),
                 source,
-            ) or legacy_observed_context
+            )
+            observed_context = generic_observed_room_context or observed_group_context
 
             # FTS write-corruption guard (#50502): when message persistence
             # fails silently through corrupt FTS triggers, the reloaded
@@ -18973,10 +18992,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _run_message = message
 
-                _api_run_message = _wrap_current_message_with_observed_context(
-                    _run_message,
-                    observed_room_context,
-                )
+                if generic_observed_room_context:
+                    _api_run_message = _wrap_current_message_with_room_context(
+                        _run_message,
+                        generic_observed_room_context,
+                    )
+                else:
+                    _api_run_message = _wrap_current_message_with_observed_context(
+                        _run_message,
+                        observed_group_context,
+                    )
                 _conversation_kwargs = {
                     "conversation_history": agent_history,
                     "task_id": session_id,
@@ -18985,7 +19010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs,
                     original_message=message,
                     persist_override=_persist_user_message_override,
-                    observed_context=observed_room_context,
+                    observed_context=observed_context,
                 )
                 if moa_config is not None:
                     _conversation_kwargs["moa_config"] = moa_config
