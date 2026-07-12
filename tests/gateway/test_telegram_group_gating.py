@@ -300,7 +300,7 @@ def test_observed_group_context_wraps_multimodal_current_message_without_mutatin
     assert wrapped[1] == original[1]
 
 
-def test_observed_group_context_replays_normally_without_telegram_prompt():
+def test_observed_group_context_never_replays_as_ordinary_history_without_prompt():
     from gateway.run import _build_gateway_agent_history
 
     history = [
@@ -310,7 +310,7 @@ def test_observed_group_context_replays_normally_without_telegram_prompt():
     agent_history, observed_context = _build_gateway_agent_history(history, channel_prompt=None)
 
     assert observed_context is None
-    assert agent_history == [{"role": "user", "content": "[Alice|111]\nside chatter"}]
+    assert agent_history == []
 
 
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():

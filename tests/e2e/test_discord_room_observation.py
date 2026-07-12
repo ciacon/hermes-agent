@@ -252,6 +252,46 @@ async def test_alice_mention_uses_alice_session_and_shared_room_context(presence
     assert call.session_key.endswith(":101")
 
 
+async def test_shared_thread_observation_session_is_distinct_from_conversation(
+    presence_stack,
+):
+    alice = _author(101, "Alice")
+    parent = make_fake_text_channel()
+    thread = make_fake_thread(parent=parent)
+    presence_stack.adapter.config.extra["observed_channels"].append(str(thread.id))
+    presence_stack.config.thread_sessions_per_user = False
+
+    assert await _route_authorized_message(
+        presence_stack,
+        make_discord_message(
+            content="Ambient thread fact.",
+            author=alice,
+            channel=thread,
+        ),
+    ) is True
+
+    room_entry = presence_stack.store.get_existing_session(
+        room_scoped_source(_source_for(alice, thread))
+    )
+    assert room_entry is not None
+
+    assert await _route_authorized_message(
+        presence_stack,
+        make_discord_message(
+            content=f"<@{BOT_USER_ID}> what was the ambient fact?",
+            author=alice,
+            channel=thread,
+            mentions=[presence_stack.adapter._client.user],
+        ),
+    ) is False
+
+    call = presence_stack.agent_calls[0]
+    assert call.room_context == "[Alice|101]\nAmbient thread fact."
+    assert call.session_id != room_entry.session_id
+    assert call.session_key != room_entry.session_key
+    assert presence_stack.store.load_transcript(room_entry.session_id)[0]["observed"] is True
+
+
 async def test_managed_self_role_dispatches_without_delayed_room_observation(
     presence_stack,
 ):

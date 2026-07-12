@@ -146,6 +146,75 @@ async def test_authorized_observe_event_appends_exactly_one_observed_row(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allowed_channel", "chat_type", "thread_id"),
+    (
+        ("room-1", "channel", None),
+        ("parent-1", "thread", "thread-1"),
+    ),
+)
+async def test_discord_channel_only_grant_authorizes_observation(
+    monkeypatch,
+    allowed_channel,
+    chat_type,
+    thread_id,
+):
+    """The gateway must honor the same channel grant as Discord intake."""
+    _set_hook(monkeypatch, [])
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", allowed_channel)
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    runner, _adapter = _make_runner(authorized=False)
+    del runner._is_user_authorized
+
+    result = await runner._handle_message(
+        _make_event(chat_type=chat_type, thread_id=thread_id)
+    )
+
+    assert result is None
+    assert len(runner.session_store.rows) == 1
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_channel_only_grant_authorizes_dispatch(monkeypatch):
+    _set_hook(monkeypatch, [])
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "room-1")
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    runner, _adapter = _make_runner(authorized=False)
+    del runner._is_user_authorized
+
+    result = await runner._handle_message(
+        _make_event(
+            chat_type="channel",
+            thread_id=None,
+            disposition=MessageDisposition.DISPATCH,
+        )
+    )
+
+    assert result == "agent-result"
+    runner._handle_message_with_agent.assert_awaited_once()
+
+
+def test_discord_channel_grant_never_authorizes_dm_or_unrelated_channel(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "different-room")
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    runner, _adapter = _make_runner(authorized=False)
+    del runner._is_user_authorized
+
+    dm_source = _make_event(chat_type="dm", thread_id=None).source
+    channel_source = _make_event(chat_type="channel", thread_id=None).source
+
+    assert runner._is_user_authorized(dm_source) is False
+    assert runner._is_user_authorized(channel_source) is False
+
+
+@pytest.mark.asyncio
 async def test_observed_users_share_room_session_but_keep_content_attribution(monkeypatch):
     _set_hook(monkeypatch, [])
     runner, _adapter = _make_runner(authorized=True)
@@ -307,6 +376,26 @@ def test_bounded_observation_retrieval_does_not_create_missing_room_session():
     assert store._entries == {}
 
 
+def test_legacy_collided_observations_use_bounded_migration_fallback():
+    from gateway.room_observation import load_observed_room_context, room_scoped_source
+
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    source = _make_source(chat_type="thread", thread_id="thread-1")
+    store = _make_retrieval_store()
+    store.config.thread_sessions_per_user = False
+    legacy_key = store._generate_session_key(source)
+    store._entries[legacy_key] = SimpleNamespace(session_id="legacy-collided-session")
+    store._db.messages["legacy-collided-session"] = [
+        _observed_row("too old", now - timedelta(hours=7)),
+        _observed_row("[Alice|1]\nlegacy recent", now - timedelta(minutes=5)),
+    ]
+
+    assert store._generate_session_key(room_scoped_source(source)) != legacy_key
+    assert load_observed_room_context(store, source, now=now) == (
+        "[Alice|1]\nlegacy recent"
+    )
+
+
 def test_bounded_observation_retrieval_never_crosses_room_or_thread():
     from gateway.room_observation import room_scoped_source
 
@@ -419,6 +508,47 @@ def test_per_user_addressed_keys_remain_separate_while_room_context_is_shared():
     assert store._generate_session_key(alice) != store._generate_session_key(bob)
     assert load_observed_room_context(store, alice, now=now) == "[Carol|3]\nshared context"
     assert load_observed_room_context(store, bob, now=now) == "[Carol|3]\nshared context"
+
+
+def test_observation_keys_never_collide_with_shared_conversation_keys():
+    """Shared groups and default-shared threads still need a separate room stream."""
+    from gateway.room_observation import room_scoped_source
+
+    store = _make_retrieval_store()
+    store.config.group_sessions_per_user = False
+    store.config.thread_sessions_per_user = False
+    sources = (
+        _make_source(chat_type="group", thread_id=None),
+        _make_source(chat_type="thread", thread_id="thread-1"),
+    )
+
+    for source in sources:
+        assert store._generate_session_key(room_scoped_source(source)) != (
+            store._generate_session_key(source)
+        )
+
+
+def test_observed_rows_never_enter_ordinary_agent_history():
+    """Observation age/count limits must not be bypassed by transcript replay."""
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "ordinary addressed turn"},
+        {
+            "role": "user",
+            "content": "[Alice|1]\nambient observation",
+            "observed": True,
+        },
+        {"role": "assistant", "content": "ordinary reply"},
+    ]
+
+    agent_history, legacy_context = _build_gateway_agent_history(history)
+
+    assert [row["content"] for row in agent_history] == [
+        "ordinary addressed turn",
+        "ordinary reply",
+    ]
+    assert legacy_context is None
 
 
 def test_observed_context_uses_neutral_headers_and_keeps_current_message_distinct():

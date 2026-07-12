@@ -12,16 +12,26 @@ from gateway.session import SessionSource
 logger = logging.getLogger(__name__)
 OBSERVED_ROOM_CONTEXT_LIMIT = 25
 OBSERVED_ROOM_CONTEXT_MAX_AGE = timedelta(hours=6)
+ROOM_OBSERVATION_CHAT_TYPE = "room_observation"
 
 
-def room_scoped_source(source: SessionSource) -> SessionSource:
-    """Return a source keyed to the room rather than an individual speaker."""
+def _legacy_room_scoped_source(source: SessionSource) -> SessionSource:
+    """Return the pre-namespace room source used by older observation rows."""
 
     return dataclasses.replace(
         source,
         user_id=None,
         user_id_alt=None,
         user_name=None,
+    )
+
+
+def room_scoped_source(source: SessionSource) -> SessionSource:
+    """Return a source in the dedicated room-observation session namespace."""
+
+    return dataclasses.replace(
+        _legacy_room_scoped_source(source),
+        chat_type=ROOM_OBSERVATION_CHAT_TYPE,
     )
 
 
@@ -67,22 +77,33 @@ def load_observed_room_context(
     loader = getattr(session_store, "load_recent_observed_messages", None)
     if not callable(loader):
         return None
-    try:
-        rows = loader(
-            room_scoped_source(source),
-            now=now,
-            limit=limit,
-            max_age=max_age,
-        )
-    except Exception:
-        logger.warning(
-            "Failed to load observed room context: platform=%s chat=%s thread=%s",
-            source.platform.value,
-            source.chat_id,
-            source.thread_id or "none",
-            exc_info=True,
-        )
-        return None
+    rows = []
+    # The second source is a bounded migration fallback for observations written
+    # before ROOM_OBSERVATION_CHAT_TYPE existed. In shared threads/groups that
+    # legacy key may be the addressed conversation key, but the loader returns
+    # only observed=True rows and still enforces the age/count bounds.
+    for scoped_source in (
+        room_scoped_source(source),
+        _legacy_room_scoped_source(source),
+    ):
+        try:
+            rows = loader(
+                scoped_source,
+                now=now,
+                limit=limit,
+                max_age=max_age,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to load observed room context: platform=%s chat=%s thread=%s",
+                source.platform.value,
+                source.chat_id,
+                source.thread_id or "none",
+                exc_info=True,
+            )
+            return None
+        if rows:
+            break
     if not isinstance(rows, list):
         return None
     contents = [

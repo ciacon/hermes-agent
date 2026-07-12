@@ -858,8 +858,9 @@ def _build_gateway_agent_history(
         content = msg.get("content")
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
-        if separate_observed_context and msg.get("observed") and role == "user" and content:
-            observed_room_context.append(str(content).strip())
+        if msg.get("observed"):
+            if separate_observed_context and role == "user" and content:
+                observed_room_context.append(str(content).strip())
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -932,10 +933,17 @@ def _select_cached_agent_history(
     amnesia. When the live transcript is strictly longer, keep it.
 
     Returns ``persisted_history`` unchanged unless the live copy is a longer
-    list, in which case a copy of the live transcript is returned.
+    list after observed-only rows are removed, in which case a filtered copy of
+    the live transcript is returned.
     """
-    if isinstance(live_history, list) and len(live_history) > len(persisted_history):
-        return list(live_history)
+    if isinstance(live_history, list):
+        filtered_live_history = [
+            msg
+            for msg in live_history
+            if not (isinstance(msg, dict) and msg.get("observed"))
+        ]
+        if len(filtered_live_history) > len(persisted_history):
+            return filtered_live_history
     return persisted_history
 
 
